@@ -1,0 +1,6 @@
+__title__ = 'dicomsorter'
+__description__ = 'DICOM Sorter for the MRI scanner backups'
+__url__ = 'https://github.com/harvard-nrg/dicomsorter'
+__version__ = 'v0.2.0'
+__author__ = 'Neuroinformatics Research Group'
+__author_email__ = 'info@neuroinfo.org'
