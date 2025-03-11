@@ -2,7 +2,7 @@
 When DICOM files are received by a SCP, we want to store them without any 
 processing overhead.
 
-The purpose of `dcmsort.py` is to periodically crawl over a directory 
+The purpose of `dcmsort.py` is to periodically crawl over any directory 
 containing lots of DICOM files and sort those files into subdirectories 
 that makes finding files easier.
 
@@ -15,7 +15,7 @@ The easiest way is to install `dicomsorter` is within a virtual environment
 
 ```bash
 python3 -m venv dicomsorter
-dicomsorter/bin/pip install git+https://github.com/harvard-nrg/dicomsorter@v0.1.0
+dicomsorter/bin/pip install git+https://github.com/harvard-nrg/dicomsorter.git
 ```
 
 # General overview
@@ -28,8 +28,8 @@ This program aims to be robust to unexpected terminations (e.g., `SIGKILL`,
    1. The `<Project>` will determined from the value contained in the 
       `StudyDescription` DICOM header, falling back to `UNKNOWN`.
    2. The `<Session>` will be determined from the value contained within the
-      `PatientID` DICOM header, falling back to `StudyInstanceUID`, or a
-      simple ISO-8601 timestamp.
+      `PatientID` DICOM header, or `StudyInstanceUID`, or finally
+      falling back to a simple ISO-8601 timestamp.
 
 ## practice run
 By default, `dcmsort.py` will not rename any files. You can safely run 
