@@ -1,19 +1,24 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -u
 
 import os
+import re
 import sys
 import shutil
 import pydicom
 import logging
 import filecmp
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from argparse import ArgumentParser
+from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger('dicomsorter')
-logging.basicConfig(
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
+
+IGNORE = [
+    '_Scanner',
+    '__incoming__'
+]
 
 def main():
     parser = ArgumentParser()
@@ -22,48 +27,148 @@ def main():
     parser.add_argument('--confirm', action='store_true')
     parser.add_argument('--chmod', type=int, default=504)
     parser.add_argument('--chgrp', type=str)
+    parser.add_argument('--rename', action='store_true')
+    parser.add_argument('--log-file', type=Path)
+    parser.add_argument('--log-max-bytes', type=int, default=0)
+    parser.add_argument('--log-backup-count', type=int, default=0)
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
+    # set logging level
     level = logging.INFO
     if args.verbose:
         level = logging.DEBUG
     logger.setLevel(level)
 
+    # add rotating log file handler
+    if args.log_file:
+        handler = RotatingFileHandler(
+            args.log_file,
+            maxBytes=args.log_max_bytes,
+            backupCount=args.log_backup_count
+        )
+        logger.addHandler(handler)
+
     if not args.base_dir.exists():
         logger.error(f'directory does not exist {args.base_dir}')
         sys.exit(1)
 
-    for sourcefile in args.base_dir.iterdir():
-        if not sourcefile.is_file():
+    for sourcedir in args.base_dir.iterdir():
+        # the scanner exports directories on XA60
+        if not sourcedir.is_dir():
             continue
 
-        # check if the current file is dicom format
-        try:
-            ds = pydicom.dcmread(sourcefile, stop_before_pixels=True)
-            logger.debug(f'found dicom file {sourcefile}')
-        except:
-            logger.debug(f'skipping file {sourcefile}')
+        # ignore directories known to already exist in base directory
+        if sourcedir.name in ['STUDIES'] + IGNORE:
             continue
 
-        # get project name from StudyDescription, or use UNKNOWN
-        project = ds.get('StudyDescription', 'UNKNOWN').strip().upper()
+        # back off if the directory mtime is < 1 hour old
+        mtime = sourcedir.stat().st_mtime
+        mtime = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if now - mtime < timedelta(hours=1):
+            logger.info(f'skipping directory less than 1 hour old {sourcedir}')
+            continue
+        logger.info(f'processing {sourcedir} which is more than 1 hour old')
 
-        # get session name from PatientID, fallback on StudyInstanceUID, or a timestamp
-        session = ds.get('PatientID', None)
-        if not session:
-            session = ds.get('StudyInstanceUID', None)
-        if not session:
-            now = datetime.now()
-            session = now.isoformat()
-        session = session.strip()
+        # keep track of the number of files and number of bytes
+        sourcefiles = 0
+        sourcebytes = 0
 
-        # define destination file
-        projectdir = Path(args.base_dir, project)
-        destdir = Path(projectdir, session)
-        destfile = Path(destdir, sourcefile.name)
+        # loop over sourcedir and start sorting files 
+        for dirpath, dirnames, filenames in os.walk(sourcedir, topdown=False):
+            dirpath = Path(dirpath)
+            for filename in filenames:
+                sourcefile = Path(dirpath, filename)
+                sourcefiles += 1
+                sourcebytes += sourcefile.stat().st_size
+                destfile = process_file(args, sourcefile)
+            logger.info(f'removing empty directory {dirpath}')
+            try:
+                dirpath.rmdir()
+            except OSError as e:
+                if e.errno == 39:
+                    logger.exception(e)
+                    continue
+                raise e
 
-        # create destination directory with desired ownership and mode bits
+        # validate the number of files and byte counts between source and destination
+        destfiles = 0
+        destbytes = 0
+        if destfile:
+            for path in destfile.parent.iterdir():
+                destfiles += 1
+                destbytes += path.stat().st_size
+
+            if sourcefiles != destfiles:
+                logger.critical(f'source and destination file count are different {sourcefiles}, {destfiles}')
+                sys.exit(1)
+            else:
+                logger.info(f'source and destination file count are identical {sourcefiles}, {destfiles}')
+
+            if sourcebytes != destbytes:
+                logger.critical(f'source and destination byte count are different {sourcebytes}, {destbytes}')
+                sys.exit(1)
+            else:
+                logger.info(f'source and destination byte count are identical {sourcebytes}, {destbytes}')
+
+def process_file(args, sourcefile):
+    # back off if file is less than 1 hour old
+    mtime = sourcefile.stat().st_mtime
+    mtime = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if now - mtime < timedelta(hours=1):
+        logger.info(f'skipping file less than 1 hour old {sourcefile}')
+        return
+
+    # check if the file is dicom format
+    try:
+        ds = pydicom.dcmread(sourcefile, stop_before_pixels=True)
+        logger.debug(f'found dicom file {sourcefile}')
+    except:
+        logger.debug(f'skipping file {sourcefile}')
+        return
+
+    # get project name from StudyDescription or use UNKNOWN
+    project = get_project_name(ds, default='UNKNOWN')
+def process_file(args, sourcefile):
+    # back off if file is less than 1 hour old
+    mtime = sourcefile.stat().st_mtime
+    mtime = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if now - mtime < timedelta(hours=1):
+        logger.info(f'skipping file less than 1 hour old {sourcefile}')
+        return
+
+    # check if the file is dicom format
+    try:
+        ds = pydicom.dcmread(sourcefile, stop_before_pixels=True)
+        logger.debug(f'found dicom file {sourcefile}')
+    except:
+        logger.debug(f'skipping file {sourcefile}')
+        return
+
+    # get project name from StudyDescription or use UNKNOWN
+    project = get_project_name(ds, default='UNKNOWN')
+
+    # get session name from PatientID, fallback on StudyInstanceUID, or a timestamp
+    timestamp = datetime.now().isoformat()
+    session = get_session_name(ds, default=timestamp)
+
+    # define destination directory
+    projectdir = Path(args.base_dir, 'STUDIES', project)
+    destdir = Path(projectdir, session)
+
+    # create a destination file
+    try:
+        basename = get_file_basename(ds, session)
+    except Exception as e:
+        logger.exception(e)
+        return
+    destfile = Path(destdir, basename)
+
+    # create destination directory with desired ownership and mode bits
+    if args.do_sort:
         if not destdir.exists():
             projectdir.mkdir(parents=True, exist_ok=True)
             if args.chmod:
@@ -80,30 +185,97 @@ def main():
                 logger.debug(f'setting group ownership on {destdir} to {args.chgrp}')
                 shutil.chown(destdir, group=args.chgrp)
 
-        # compare source and destination files
-        logger.info(f'source file {sourcefile}')
-        logger.info(f'destination file {destfile}')
-        try:
-            # skip file if source and destination files are different
-            if not filecmp.cmp(sourcefile, destfile):
-                logger.warning(f'source and destination exist and are not identical')
-                continue
-            else:
-                logger.info(f'source and destination exist and are identical')
-        except FileNotFoundError:
-            # destination (or source) file does not exist
-            pass
+    # compare source and destination files
+    logger.info(f'source file {sourcefile}')
+    logger.info(f'destination file {destfile}')
+    try:
+        # skip file if source and destination files are different
+        if not filecmp.cmp(sourcefile, destfile):
+            logger.warning(f'source and destination exist and are not identical')
+            return
+        else:
+            logger.info(f'source and destination exist and are identical')
+    except FileNotFoundError:
+        # destination (or source) file does not exist
+        pass
 
-        # rename source file to destination
-        if args.do_sort:
-            try:
-                logger.info(f'renaming source to destination')
-                if args.confirm:
-                    input('press enter to continue')
-                sourcefile.rename(destfile)
-            except Exception as e:
-                logger.exception(e)
-                continue
+    # atomically rename source file to destination
+    if args.do_sort:
+        try:
+            logger.info(f'renaming source to destination')
+            if args.confirm:
+                input('press enter to continue')
+            sourcefile.rename(destfile)
+        except Exception as e:
+            logger.exception(e)
+            return
+
+    return destfile
+
+def get_file_basename(ds, session):
+    session = get_session_name(ds, '')
+    modality = get_modality_name(ds, '')
+    series_number = get_series_number(ds, '')
+    instance_number = get_instance_number(ds, '')
+    sopinstanceuid = get_sop_instance_uid(ds)
+    parts = list()
+    if session:
+        parts.append(session)
+    if modality:
+        parts.append(modality)
+    if series_number:
+        parts.append(series_number)
+    if instance_number:
+        parts.append(instance_number)
+    #parts.append(sopclassuid)
+    parts.append(sopinstanceuid)
+    basename = '.'.join(parts)
+    return f'{basename}.dcm'
+
+def get_sop_class_uid(ds):
+    value = str(ds.get('SOPClassUID', '')).strip()
+    if not value:
+        raise SOPClassUIDError(ds.filename)
+    return value
+
+def get_sop_instance_uid(ds):
+    value = str(ds.get('SOPInstanceUID', '')).strip()
+    if not value:
+        raise SOPInstanceUIDError(ds.filename)
+    return value
+
+def get_instance_number(ds, default='UNKNWON'):
+    return str(ds.get('InstanceNumber', default)).strip()
+
+def get_series_number(ds, default='UNKNWON'):
+    return str(ds.get('SeriesNumber', default)).strip()
+    
+def get_modality_name(ds, default='UNKNOWN'):
+    return str(ds.get('Modality', default)).strip()
+
+def get_project_name(ds, default='UNKNOWN', upper=True):
+    value = str(ds.get('StudyDescription', default)).strip()
+    if not value:
+        value = default
+    value = re.sub(r'\s+', '_', value)
+    if upper:
+        return value.upper()
+    return value
+
+def get_session_name(ds, default='UNKNOWN'):
+    value = str(ds.get('PatientID', '')).strip()
+    if not value:
+        value = str(ds.get('StudyInstanceUID', '')).strip()
+    if not value:
+        value = default
+    value = re.sub(r'\s+', '_', value)
+    return value
+
+class SOPClassUIDError(Exception):
+    pass
+
+class SOPInstanceUIDError(Exception):
+    pass
 
 if __name__ == '__main__':
     main()
